@@ -1,4 +1,6 @@
-import { resetCapabilitiesCache, setCapabilities } from "@earendil-works/pi-tui";
+import { Buffer } from "node:buffer";
+import { inflateRawSync } from "node:zlib";
+import { resetCapabilitiesCache, setCapabilities, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it } from "vitest";
 import type { MarkdownTransformContext } from "../src/core/extensions/types.ts";
 import type { MermaidRenderingMode } from "../src/core/settings-manager.ts";
@@ -40,12 +42,70 @@ describe("Mermaid rendering", () => {
 		expect(rendered).toContain("After");
 	});
 
-	it("leaves unsupported and oversized diagrams unchanged", () => {
+	it("leaves unsupported diagrams unchanged and crops oversized diagrams to the available width", () => {
 		const unsupported = "```mermaid\ngantt\n  title Plan\n```";
 		const oversized = "```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```";
 
+		setCapabilities({ images: null, trueColor: true, hyperlinks: false });
 		expect(transformMermaid(unsupported)).toBe(unsupported);
-		expect(transformMermaid(oversized, { maxWidth: 10 })).toBe(oversized);
+		const rendered = transformMermaid(oversized, { maxWidth: 10 });
+		expect(rendered).not.toContain("```mermaid");
+		expect(rendered).not.toContain("\x1b]8;;");
+		for (const row of rendered.trimEnd().split("  \n")) {
+			expect(row.startsWith("`") && row.endsWith("`")).toBe(true);
+			expect(visibleWidth(row.slice(1, -1))).toBeLessThanOrEqual(10);
+		}
+	});
+
+	it("links finalized oversized diagrams to their compressed source", () => {
+		const source = "flowchart LR\n  A[こんにちは 🧜] --> B[Done]";
+		const markdown = `\`\`\`mermaid\n${source}\n\`\`\``;
+
+		setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+		const rendered = transformMermaid(markdown, { maxWidth: 10 });
+
+		expect(rendered).toMatch(/Mermaid diagram is \d+ columns wide\./);
+		expect(rendered).not.toContain("```mermaid");
+		expect(rendered).toContain("┌");
+		const match = /\x1b]8;;([^\x1b]+)\x1b\\Open in browser\x1b]8;;\x1b\\/.exec(rendered);
+		expect(match).not.toBeNull();
+		const url = match?.[1] ?? "";
+		const parsedUrl = new URL(url);
+		const renderPath = "/render/";
+		const payloadStart = parsedUrl.pathname.indexOf(renderPath);
+		expect(payloadStart).toBeGreaterThanOrEqual(0);
+		const payload = parsedUrl.pathname.slice(payloadStart + renderPath.length);
+		expect(payload).toMatch(/^[A-Za-z0-9_-]+$/);
+		expect(inflateRawSync(Buffer.from(payload, "base64url")).toString("utf8")).toBe(source);
+	});
+
+	it("renders a cropped oversized diagram without linking while streaming", () => {
+		const markdown = "```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```";
+
+		setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+		const rendered = transformMermaid(markdown, { maxWidth: 10, isStreaming: true });
+		expect(rendered).not.toContain("```mermaid");
+		expect(rendered).toContain("┌");
+		expect(rendered).not.toContain("Open in browser");
+		expect(rendered).not.toContain("\x1b]8;;");
+	});
+
+	it("keeps the cropped preview when the browser URL would be too long", () => {
+		const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+		let state = 1;
+		let label = "";
+		for (let index = 0; index < 10_000; index++) {
+			state = (state * 48_271) % 2_147_483_647;
+			label += alphabet[state % alphabet.length];
+		}
+		const markdown = `\`\`\`mermaid\nflowchart LR\n  A[${label}]\n\`\`\``;
+
+		setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+		const rendered = transformMermaid(markdown, { maxWidth: 10 });
+
+		expect(rendered).not.toContain("```mermaid");
+		expect(rendered).toContain("┌");
+		expect(rendered).not.toContain("\x1b]8;;");
 	});
 
 	it("renders diagram types added by lovely-mermaid", () => {
@@ -119,12 +179,14 @@ describe("Mermaid rendering", () => {
 
 	it("falls back to the code block with a warning after streaming", () => {
 		const markdown = "```mermaid\nflowchart LR\n  A --> B\n  broken !\n```";
-		const final = transformMermaid(markdown);
+		setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+		const final = transformMermaid(markdown, { maxWidth: 1 });
 		const followedByText = transformMermaid(`${markdown}\nFollowing text`);
 		const streaming = transformMermaid(markdown, { isStreaming: true });
 
 		expect(final).toContain(markdown);
 		expect(final).toContain("```\n`Mermaid diagram not rendered");
+		expect(final).not.toContain("Open in browser");
 		expect(final).toContain('dropped, expected a link: "!"');
 		expect(final).not.toContain("more)");
 		expect(followedByText).toContain("  \nFollowing text");

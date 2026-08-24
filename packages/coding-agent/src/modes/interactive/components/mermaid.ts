@@ -1,10 +1,13 @@
-import { getCapabilities, Marked, type Token } from "@earendil-works/pi-tui";
+import { deflateRawSync } from "node:zlib";
+import { getCapabilities, hyperlink, Marked, type Token, truncateToWidth } from "@earendil-works/pi-tui";
 import { type AnsiTheme, type MermaidArt, render, toAnsi } from "lovely-mermaid";
 import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
 import type { MermaidRenderingMode } from "../../../core/settings-manager.ts";
 import type { Theme, ThemeColor } from "../theme/theme.ts";
 
 const markdownParser = new Marked();
+const BROWSER_RENDER_URL = "https://xl0.github.io/lovely-mermaid/render";
+const MAX_BROWSER_RENDER_URL_LENGTH = 8 * 1024;
 
 type MermaidTheme = Pick<Theme, "fg" | "getFgAnsi">;
 
@@ -62,6 +65,11 @@ function themedLines(art: MermaidArt, theme: MermaidTheme): string[] {
 	return toAnsi(displayArt, ansiTheme);
 }
 
+function browserRenderUrl(source: string): string | undefined {
+	const url = `${BROWSER_RENDER_URL}/${deflateRawSync(source, { level: 9 }).toString("base64url")}`;
+	return url.length <= MAX_BROWSER_RENDER_URL_LENGTH ? url : undefined;
+}
+
 /** Create a transformer that replaces top-level Mermaid code blocks with Unicode terminal diagrams. */
 export function createMermaidMarkdownTransformer(options: MermaidTransformerOptions): MarkdownTransformer {
 	return (markdown, context) => {
@@ -79,7 +87,7 @@ export function createMermaidMarkdownTransformer(options: MermaidTransformerOpti
 			.map((token) => {
 				if (!isMermaid(token)) return token.raw;
 				const art = render(token.text);
-				if (!art || art.width > context.availableWidth) return token.raw;
+				if (!art) return token.raw;
 				if (!context.isStreaming && art.warnings.length > 0) {
 					const suffix = art.warnings.length > 1 ? ` (+${art.warnings.length - 1} more)` : "";
 					const warning = `Mermaid diagram not rendered: ${art.warnings[0]}${suffix}`;
@@ -87,8 +95,21 @@ export function createMermaidMarkdownTransformer(options: MermaidTransformerOpti
 					return `${token.raw}\n${codeSpan(styledWarning)}  \n`;
 				}
 				const lines = options.theme ? themedLines(art, options.theme) : art.plain;
+				const visibleLines =
+					art.width > context.availableWidth
+						? lines.map((line) => truncateToWidth(line, context.availableWidth, ""))
+						: lines;
+				const diagram = `${visibleLines.map(codeSpan).join("  \n")}\n`;
+				if (art.width > context.availableWidth && !context.isStreaming && getCapabilities().hyperlinks) {
+					const url = browserRenderUrl(token.text);
+					if (!url) return diagram;
+					const description = `Mermaid diagram is ${art.width} columns wide.`;
+					const styledDescription = options.theme ? options.theme.fg("muted", description) : description;
+					const action = options.theme ? options.theme.fg("accent", "Open in browser") : "Open in browser";
+					return `${diagram}${codeSpan(`${styledDescription} ${hyperlink(action, url)}`)}\n`;
+				}
 				// Markdown hard breaks keep every diagram row on its own line.
-				return `${lines.map(codeSpan).join("  \n")}\n`;
+				return diagram;
 			})
 			.join("");
 	};
